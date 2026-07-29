@@ -1,23 +1,27 @@
 #!/bin/bash
-
-if [ "$PWD" = "/" ]; then
-    echo "Error: No working directory set. Please set a WORKDIR in your Dockerfile before running this script."
-    exit 1
-fi
+# Orchestrates grading: start gateway, run pytest, emit reward 0/1.
 
 mkdir -p /logs/verifier
 
-# pytest + pytest-json-ctrf are pre-installed in the verifier image (shared mode).
-# allow_internet=false, so no wheels are resolved at run time — invoke pytest directly.
-python -m pytest --ctrf /logs/verifier/ctrf.json /tests/test_outputs.py -rA
+rm -f /app/releases.duckdb
+rm -f /app/distribution-gateway/data/*.json
+pkill -f "distribution-gateway/server.js" 2>/dev/null || true
+sleep 0.5
+
+node /app/distribution-gateway/server.js &
+GW=$!
+sleep 2
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd /app
+python3 -m pytest -rA -p no:cacheprovider "$SCRIPT_DIR/test_outputs.py"
 code=$?
 
-# Surface pytest's raw exit code so the negative-control check can tell "tests ran
-# and failed" (code 1, expected with no solution) from "tests could not run" (>=2).
-echo "pytest exit code: ${code}"
+kill "$GW" 2>/dev/null || true
 
 if [ "$code" -eq 0 ]; then
   echo 1 > /logs/verifier/reward.txt
 else
   echo 0 > /logs/verifier/reward.txt
 fi
+echo "reward: $(cat /logs/verifier/reward.txt)"

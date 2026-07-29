@@ -1,132 +1,104 @@
-"""Verifier tests for the RiftArena cartridge-decode repair task.
+import re
+import subprocess
+import csv
+import duckdb
+import requests
 
-Each test maps to a functional_criteria[] entry. The tests drive the headless
-scripted-playthrough harness (``riftarena.playthrough.run_playthrough``) — which
-needs no TTY and never launches the Textual UI — and compare the observed room
-graph, inventory transitions, and ending score against the canonical values
-documented in docs/arena_design_log.md.
+def mask(lines):
+    return [re.sub(r"RECEIPT=\S+", "RECEIPT=<id>", ln) for ln in lines]
 
-The four "repaired" tests call ``run_playthrough()`` with no arguments, so they
-read the live decode profile the player edits (config/cartridge_profile.toml).
-They pass only when that profile has been corrected; against the shipped
-(mis-configured) profile the cartridge disassembles wrongly and they fail.
+def bundle_lines(text):
+    return [ln for ln in text.splitlines() if ln.startswith("BUNDLE ")]
 
-Run via tests/test.sh, which writes /logs/verifier/reward.txt.
-"""
-
-from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-# The game lives under environment/riftarena; make its package importable
-# regardless of how pytest is invoked. Harbor runs from the workspace root.
-PROJECT_ROOT = Path.cwd() / "environment" / "riftarena"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from riftarena.playthrough import run_playthrough  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Canonical expected outcome — the ground truth from the design log. Pinned
-# here as verifier-owned constants so grading does not depend on any value the
-# player could edit inside environment/.
-# ---------------------------------------------------------------------------
-EXPECTED_ROOM_GRAPH = {
-    0: {"name": "Rift Threshold", "exits": {"north": 1, "east": 2}},
-    1: {"name": "Echo Vault", "exits": {"south": 0, "east": 3}},
-    2: {"name": "Sunken Gallery", "exits": {"north": 3, "west": 0}},
-    3: {"name": "Obsidian Span", "exits": {"south": 2, "east": 4, "west": 1}},
-    4: {"name": "Crown Sanctum", "exits": {"west": 3}},
-}
-
-EXPECTED_INVENTORY_TRANSITIONS = [
-    [],
-    ["Brass Key"],
-    ["Brass Key"],
-    ["Brass Key", "Echo Shard"],
-    ["Brass Key", "Echo Shard", "Obsidian Lens"],
-    ["Brass Key", "Echo Shard", "Obsidian Lens", "Riftcrown"],
-]
-
-EXPECTED_ENDING_SCORE = 400
-
-# A decode profile that is correct in every dimension except the quest-state
-# record stride (4 instead of the canonical 6). Rooms and items still decode
-# cleanly (so nothing crashes), but the quest-opcode stream is read against the
-# wrong byte boundaries, yielding a wrong inventory/score. Used by the
-# sensitivity check below; independent of whatever the player writes to the live
-# profile.
-_WRONG_PROFILE_TOML = """\
-[cartridge]
-title = "RiftArena: Crown of the Rift"
-revision = 2
-
-[format]
-endian = "little"
-header_endian = "little"
-
-[opcode_widths]
-room_field = 2
-quest_opcode = 6
-
-[quest_state]
-table_offset_field = "quest_offset"
-record_stride = 4
-"""
-
-
-def test_playthrough_runs_to_completion():
-    """functional_criteria[id=playthrough_runs_to_completion]: with a correct
-    profile the scripted playthrough loads the cartridge, quest-state database
-    and local API and runs to the goal without crashing or stalling."""
-    outcome = run_playthrough()
-    assert outcome["finished"] is True, (
-        "scripted playthrough did not reach the goal (rooms unsolvable under the "
-        "current decode profile)"
+def test_report_matches_golden():
+    result = subprocess.run(
+        ["npm", "run", "report", "--silent"],
+        cwd="/app", capture_output=True, text=True,
     )
+    actual = mask(bundle_lines(result.stdout))
 
+    with open("/app/reports/publications.expected.txt") as f:
+        expected = mask(bundle_lines(f.read()))
 
-def test_room_graph_matches_expected():
-    """functional_criteria[id=room_graph_matches_expected]: the visited rooms and
-    their exits match the documented topology. Fails while opcode widths /
-    endianness are wrong and the cartridge disassembles into wrong rooms."""
-    outcome = run_playthrough()
-    assert outcome["room_graph"] == EXPECTED_ROOM_GRAPH
+    assert actual == expected, f"output mismatch:\n{actual}\nvs\n{expected}"
 
+def publishable_bundles_from_manifest():
+    with open("/app/fixtures/build_manifest.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
 
-def test_inventory_transitions_match_expected():
-    """functional_criteria[id=inventory_transitions_match_expected]: the sequence
-    of inventory snapshots captured across the playthrough matches the documented
-    sequence. Fails while the quest-state table mapping is wrong."""
-    outcome = run_playthrough()
-    assert outcome["inventory_transitions"] == EXPECTED_INVENTORY_TRANSITIONS
+    seen, unique = set(), []
+    for r in rows:
+        key = tuple(r.items())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+    
+    withdrawn = { r["supersedes_id"] for r in unique if r["record_type"] == "WITHDRAWAL" }
+    bundles = { r["bundle_id"] for r in unique if r["record_type"] == "BUILD" and r["entry_id"] not in withdrawn }
+    return bundles
 
-
-def test_ending_score_matches_expected():
-    """functional_criteria[id=ending_score_matches_expected]: the final score
-    equals the documented value. Fails while endian flags or the quest-state
-    table mapping are wrong."""
-    outcome = run_playthrough()
-    assert outcome["ending_score"] == EXPECTED_ENDING_SCORE
-
-
-def test_mis_config_fails_playthrough(tmp_path):
-    """functional_criteria[id=mis_config_fails_playthrough]: a profile with the
-    wrong decode parameters does NOT reproduce the canonical room graph /
-    inventory / score, so grading is sensitive to the repair rather than
-    tautologically satisfied."""
-    wrong_profile = tmp_path / "wrong_profile.toml"
-    wrong_profile.write_text(_WRONG_PROFILE_TOML, encoding="utf-8")
-
-    outcome = run_playthrough(config_path=str(wrong_profile))
-
-    matches_canonical = (
-        outcome["room_graph"] == EXPECTED_ROOM_GRAPH
-        and outcome["inventory_transitions"] == EXPECTED_INVENTORY_TRANSITIONS
-        and outcome["ending_score"] == EXPECTED_ENDING_SCORE
+def run_report():
+    result = subprocess.run(
+        ["npm", "run", "report", "--silent"],
+        cwd="/app", capture_output=True, text=True,
     )
-    assert not matches_canonical, (
-        "a deliberately mis-configured decode profile reproduced the canonical "
-        "outcome — the grader is not sensitive to the decode parameters"
+    return result.stdout
+def test_all_bundles_published_with_current_key():
+    out = run_report()
+    published = [ln for ln in bundle_lines(out) if "PUBLISHED" in ln]
+    assert len(published) == len(publishable_bundles_from_manifest())
+
+    assert "UNTRUSTED_SIGNATURE" not in out
+    for ln in published:
+        assert "STATUS=PUBLISHED" in ln
+
+def test_receipts_persisted_in_duckdb():
+    run_report()  
+    con = duckdb.connect("/app/releases.duckdb")
+    try:
+        rows = con.execute(
+            "SELECT request_token, publication_id FROM publications"
+        ).fetchall()
+    finally:
+        con.close()
+
+    tokens = {r[0] for r in rows}         
+    assert tokens == {"token-BND-101", "token-BND-102", "token-BND-103"}
+    assert all(r[1] for r in rows)       
+def published_bundles_from_report():
+    result = subprocess.run(
+        ["npm", "run", "report", "--silent"],
+        cwd="/app", capture_output=True, text=True,
     )
+    return {ln.split()[1] for ln in bundle_lines(result.stdout)}
+
+def test_rerun_is_idempotent():
+    first = bundle_lines(run_report())
+    second = bundle_lines(run_report())
+    assert first, "no report output to compare — publisher produced nothing"
+    assert first == second
+def test_revoked_key_signature_is_rejected():
+    descriptor = '{"artifact_count":1,"bundle_id":"BND-TEST","total_bytes":1}'
+    with open("/tmp/verifier-desc.bin", "w") as f:
+        f.write(descriptor)
+    signature = subprocess.run(
+        ["openssl", "cms", "-sign", "-in", "/tmp/verifier-desc.bin",
+         "-signer", "/app/keys/revoked/revoked.cert.pem",
+         "-inkey",  "/app/keys/revoked/revoked.key.pem",
+         "-outform", "PEM", "-binary"],
+        capture_output=True, text=True,
+    ).stdout
+
+    resp = requests.post(
+        "http://127.0.0.1:7070/v1/publications",
+        json={"descriptor": descriptor, "signature": signature,
+              "request_token": "token-verifier-revoked"},
+    )
+    assert resp.status_code != 200
+    
+    assert resp.json().get("error") == "UNTRUSTED_SIGNATURE"
+def test_reconciliation_matches_independent_recompute():
+    expected = publishable_bundles_from_manifest()
+    published = published_bundles_from_report()
+    assert published == expected, f"published {published} != expected {expected}"
